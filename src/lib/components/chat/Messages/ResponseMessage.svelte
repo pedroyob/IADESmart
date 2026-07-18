@@ -63,11 +63,14 @@
 	import RegenerateMenu from './ResponseMessage/RegenerateMenu.svelte';
 	import StatusHistory from './ResponseMessage/StatusHistory.svelte';
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
+	import OutputEditView from './OutputEditView.svelte';
+	import { getOutputText, replaceOutputMessageText, type OutputItem } from './structuredOutput';
 
 	interface MessageType {
 		id: string;
 		model: string;
 		content: string;
+		output?: OutputItem[];
 		files?: { type: string; url: string }[];
 		timestamp: number;
 		role: string;
@@ -126,7 +129,11 @@
 		if (source) {
 			// Fast path: O(1) check on the fields that change most often (content during streaming, done at end)
 			// Avoids 2x O(n) JSON.stringify calls that are always true during streaming anyway
-			if (message.content !== source.content || message.done !== source.done) {
+			if (
+				message.content !== source.content ||
+				message.done !== source.done ||
+				message.output?.length !== source.output?.length
+			) {
 				message = structuredClone(source);
 			} else if (!equal(message, source)) {
 				// Slow path: full comparison for infrequent changes (sources, annotations, status, etc.)
@@ -174,9 +181,13 @@
 		(model?.info?.meta?.capabilities?.status_updates ?? true) &&
 		statusEntries.length > 0 &&
 		!(statusEntries.at(-1)?.hidden ?? false);
+	$: visibleResponseContent =
+		getOutputText(message.output) || removeAllDetails(message.content ?? '');
+	$: hasResponseContent = Boolean((message.content ?? '').trim() || message.output?.length);
 
 	let edit = false;
 	let editedContent = '';
+	let editedOutput: any[] | null = null;
 	let editTextAreaElement: HTMLTextAreaElement;
 
 	let messageIndexEdit = false;
@@ -224,7 +235,8 @@
 			: $config?.audio?.tts?.voice);
 
 	const speak = async () => {
-		if (!(message?.content ?? '').trim().length) {
+		const content = visibleResponseContent;
+		if (!content.trim().length) {
 			toast.info($i18n.t('No content to speak'));
 			return;
 		}
@@ -234,7 +246,6 @@
 		const { signal } = speakAbort;
 
 		speaking = true;
-		const content = removeAllDetails(message.content);
 
 		if ($config.audio.tts.engine === '') {
 			let voices = [];
@@ -371,36 +382,54 @@
 	const editMessageHandler = async () => {
 		edit = true;
 
-		editedContent = preprocessForEditing(message.content);
+		if (message.output?.length) {
+			// Structured edit: use the block editor
+			editedOutput = structuredClone(message.output);
+		} else {
+			// Legacy text edit: use the textarea
+			editedContent = preprocessForEditing(message.content);
+		}
 
 		await tick();
 
-		const messagesContainer = document.getElementById('messages-container');
-		const savedScrollTop = messagesContainer?.scrollTop;
+		if (!editedOutput && editTextAreaElement) {
+			const messagesContainer = document.getElementById('messages-container');
+			const savedScrollTop = messagesContainer?.scrollTop;
 
-		editTextAreaElement.style.height = '';
-		editTextAreaElement.style.height = `${editTextAreaElement.scrollHeight}px`;
+			editTextAreaElement.style.height = '';
+			editTextAreaElement.style.height = `${editTextAreaElement.scrollHeight}px`;
 
-		if (messagesContainer) messagesContainer.scrollTop = savedScrollTop;
+			if (messagesContainer) messagesContainer.scrollTop = savedScrollTop;
+		}
 	};
 
 	const editMessageConfirmHandler = async () => {
-		const messageContent = postprocessAfterEditing(editedContent ? editedContent : '');
-		editMessage(message.id, { content: messageContent }, false);
+		if (editedOutput) {
+			editMessage(message.id, { output: editedOutput }, false);
+		} else {
+			// Legacy text edit
+			const messageContent = postprocessAfterEditing(editedContent ?? '');
+			editMessage(message.id, { content: messageContent }, false);
+		}
 
 		edit = false;
 		editedContent = '';
+		editedOutput = null;
 
 		await tick();
 	};
 
 	const saveAsCopyHandler = async () => {
-		const messageContent = postprocessAfterEditing(editedContent ? editedContent : '');
-
-		editMessage(message.id, { content: messageContent });
+		if (editedOutput) {
+			editMessage(message.id, { output: editedOutput });
+		} else {
+			const messageContent = postprocessAfterEditing(editedContent ?? '');
+			editMessage(message.id, { content: messageContent });
+		}
 
 		edit = false;
 		editedContent = '';
+		editedOutput = null;
 
 		await tick();
 	};
@@ -408,6 +437,7 @@
 	const cancelEditMessage = async () => {
 		edit = false;
 		editedContent = '';
+		editedOutput = null;
 		await tick();
 	};
 
@@ -665,12 +695,12 @@
 							<StatusHistory statusHistory={message?.statusHistory} />
 						{/if}
 
-						{#if message?.files && message.files?.filter((f) => f.type === 'image').length > 0}
+						{#if message?.files && message.files?.filter( (f) => ['image', 'file'].includes(f.type) ).length > 0}
 							<div
 								class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap"
 								dir={$settings?.chatDirection ?? 'auto'}
 							>
-								{#each message.files as file}
+								{#each message.files.filter((f) => ['image', 'file'].includes(f.type)) as file}
 									<div>
 										{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/')}
 											<Image src={file.url} alt={message.content} />
@@ -709,34 +739,45 @@
 						{/if}
 
 						{#if edit === true}
-							<div class="w-full bg-gray-50 dark:bg-gray-800 rounded-3xl px-5 py-3 my-2">
-								<textarea
-									id="message-edit-{message.id}"
-									bind:this={editTextAreaElement}
-									class=" bg-transparent outline-hidden w-full resize-none"
-									bind:value={editedContent}
-									on:input={(e) => {
-										const messagesContainer = document.getElementById('messages-container');
-										const savedScrollTop = messagesContainer?.scrollTop;
+							<div class="w-full bg-gray-50 dark:bg-gray-800 rounded-3xl px-3 py-3 my-2">
+								{#if editedOutput}
+									<!-- Structured output editor (visual + JSON toggle) -->
+									<OutputEditView
+										output={editedOutput}
+										onChange={(updated) => {
+											editedOutput = updated;
+										}}
+									/>
+								{:else}
+									<!-- Legacy textarea for messages without output -->
+									<textarea
+										id="message-edit-{message.id}"
+										bind:this={editTextAreaElement}
+										class=" bg-transparent outline-hidden w-full resize-none"
+										bind:value={editedContent}
+										on:input={(e) => {
+											const messagesContainer = document.getElementById('messages-container');
+											const savedScrollTop = messagesContainer?.scrollTop;
 
-										e.target.style.height = '';
-										e.target.style.height = `${e.target.scrollHeight}px`;
+											e.target.style.height = '';
+											e.target.style.height = `${e.target.scrollHeight}px`;
 
-										if (messagesContainer) messagesContainer.scrollTop = savedScrollTop;
-									}}
-									on:keydown={(e) => {
-										if (e.key === 'Escape') {
-											document.getElementById('close-edit-message-button')?.click();
-										}
+											if (messagesContainer) messagesContainer.scrollTop = savedScrollTop;
+										}}
+										on:keydown={(e) => {
+											if (e.key === 'Escape') {
+												document.getElementById('close-edit-message-button')?.click();
+											}
 
-										const isCmdOrCtrlPressed = e.metaKey || e.ctrlKey;
-										const isEnterPressed = e.key === 'Enter';
+											const isCmdOrCtrlPressed = e.metaKey || e.ctrlKey;
+											const isEnterPressed = e.key === 'Enter';
 
-										if (isCmdOrCtrlPressed && isEnterPressed) {
-											document.getElementById('confirm-edit-message-button')?.click();
-										}
-									}}
-								/>
+											if (isCmdOrCtrlPressed && isEnterPressed) {
+												document.getElementById('confirm-edit-message-button')?.click();
+											}
+										}}
+									/>
+								{/if}
 
 								<div class=" mt-2 mb-1 flex justify-between text-sm font-medium">
 									<div>
@@ -781,14 +822,15 @@
 							class="w-full flex flex-col relative {edit ? 'hidden' : ''}"
 							id="response-content-container"
 						>
-							{#if message.content === '' && !message.done && !message.error && !hasVisibleStatus}
+							{#if !hasResponseContent && !message.done && !message.error && !hasVisibleStatus}
 								<Skeleton />
-							{:else if message.content && message.error !== true}
+							{:else if hasResponseContent && message.error !== true}
 								<!-- always show message contents even if there's an error -->
 								<!-- unless message.error === true which is legacy error handling, where the error message is stored in message.content -->
 								<ContentRenderer
 									id={`${chatId}-${message.id}`}
 									content={message.content}
+									output={message.output}
 									sources={message.sources}
 									floatingButtons={message?.done &&
 										!readOnly &&
@@ -815,9 +857,27 @@
 										setInputText(text);
 									}}
 									onSave={({ raw, oldContent, newContent }) => {
-										history.messages[message.id].content = history.messages[
-											message.id
-										].content.replace(raw, raw.replace(oldContent, newContent));
+										const sourceMessage = history.messages[message.id];
+										if (sourceMessage.output?.length) {
+											const updatedOutput = replaceOutputMessageText(
+												sourceMessage.output,
+												oldContent,
+												newContent
+											);
+											if (updatedOutput !== sourceMessage.output) {
+												sourceMessage.output = updatedOutput;
+											} else {
+												sourceMessage.content = sourceMessage.content.replace(
+													raw,
+													raw.replace(oldContent, newContent)
+												);
+											}
+										} else {
+											sourceMessage.content = sourceMessage.content.replace(
+												raw,
+												raw.replace(oldContent, newContent)
+											);
+										}
 
 										updateChat();
 									}}
@@ -988,7 +1048,7 @@
 											? 'visible'
 											: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition copy-response-button"
 										on:click={() => {
-											copyToClipboard(message.content);
+											copyToClipboard(visibleResponseContent);
 										}}
 									>
 										<svg
